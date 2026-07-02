@@ -1,0 +1,6 @@
+opencv-python-headless
+numpy
+scikit-learn
+PyWavelets
+joblib
+scikit-image
