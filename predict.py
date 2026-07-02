@@ -2214,13 +2214,22 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
 from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.metrics import accuracy_score, classification_report, f1_score, roc_curve
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.base import is_classifier
 
-try:
-    from xgboost import XGBClassifier
-    XGB_AVAILABLE = True
-except ImportError:
-    from sklearn.svm import SVC
-    XGB_AVAILABLE = False
+from sklearn.svm import SVC
+
+# XGBoost can be installed in one Python environment but incompatible with that
+# environment's scikit-learn version. Keep the stable SVM fallback as the default.
+XGB_AVAILABLE = False
+if os.environ.get("USE_XGBOOST") == "1":
+    try:
+        from xgboost import XGBClassifier
+        is_classifier(XGBClassifier())
+        XGB_AVAILABLE = True
+    except Exception as exc:
+        print(f"XGBoost disabled: incompatible with this scikit-learn environment ({exc})")
+        XGB_AVAILABLE = False
 
 MODEL_FILE = "model.pkl"
 IMG_EXTS = ("*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG")
@@ -2428,10 +2437,29 @@ def _noise_variance(gray, work_size=256):
         return 0.0
     return float((mad / 0.6745) ** 2)
 
+def _brightness_center_ratio(img_bgr):
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    cy, cx = h // 2, w // 2
+    half_h, half_w = int(h * 0.35), int(w * 0.35)
+    center = gray[cy-half_h:cy+half_h, cx-half_w:cx+half_w]
+    mean_all = np.mean(gray)
+    mean_center = np.mean(center)
+    return float(mean_center / (mean_all + 1e-8))
+
 def extract_features(img_bgr):
+    # ------ NEW: Center crop to 60% (discards background) ------
+    h, w = img_bgr.shape[:2]
+    crop_h, crop_w = int(h * 0.6), int(w * 0.6)
+    y = (h - crop_h) // 2
+    x = (w - crop_w) // 2
+    img_bgr = img_bgr[y:y+crop_h, x:x+crop_w]
+    # ------------------------------------------------------------
+
     img_bgr = _resize_max_side(img_bgr, 512)
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
+    # Existing features
     fft_peak_ratio, fft_radial_std = _fft_features(gray)
     colorfulness = _colorfulness(img_bgr)
     sat_mean, sat_std = _saturation_stats(img_bgr)
@@ -2452,6 +2480,9 @@ def extract_features(img_bgr):
     edge_orient_entropy = _edge_orientation_entropy(gray)
     noise_var = _noise_variance(gray)
 
+    # ------ NEW FEATURE: emissive glow ------
+    brightness_center_ratio = _brightness_center_ratio(img_bgr)
+
     return np.array([
         fft_peak_ratio, fft_radial_std, colorfulness, sat_mean, sat_std,
         blue_bias, clip_frac, lap_var, line_rect_score,
@@ -2462,9 +2493,9 @@ def extract_features(img_bgr):
         glcm_contrast, glcm_homogeneity, glcm_energy, glcm_correlation,
         lbp_var, clahe_delta, color_fft_ratio, dct_ac_ratio,
         local_var_hetero, edge_orient_entropy,
-        noise_var
+        noise_var,
+        brightness_center_ratio   # <-- NEW
     ], dtype=np.float32)
-
 
 # --------------------------------------------------------------------------
 # Training (stable hyperparameters + F1 threshold)
@@ -2511,45 +2542,45 @@ def train():
         print("Error: need more images.")
         sys.exit(1)
 
-    # Stable scaler
     scaler = QuantileTransformer(output_distribution='normal', n_quantiles=1000, random_state=0)
     X_scaled = scaler.fit_transform(X)
 
-    # Stable feature selection (threshold='median' – worked at 93.7%)
+    # FIX 1: Keep more features
     selector = SelectFromModel(LogisticRegression(C=1, max_iter=1000, class_weight='balanced'),
-                               threshold='median')
+                               threshold='mean')   # <--- changed from 'median'
     X_selected = selector.fit_transform(X_scaled, y)
     print(f"Selected {X_selected.shape[1]} out of {X.shape[1]} features")
 
     n_splits = min(5, int(np.min(np.bincount(y))))
     cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=0)
 
-    # Stable hyperparameters (exactly as they were at 93.7%)
+    # FIX 2: Stronger ensemble
     clf_lr = LogisticRegression(C=3.0, max_iter=2000, class_weight='balanced', random_state=0)
-    clf_rf = RandomForestClassifier(n_estimators=200, max_depth=5, class_weight='balanced', random_state=0)
-
+    clf_rf = RandomForestClassifier(n_estimators=300, max_depth=8, class_weight='balanced', random_state=0)
     if XGB_AVAILABLE:
-        clf_xgb = XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.1,
+        clf_xgb = XGBClassifier(n_estimators=150, max_depth=5, learning_rate=0.15,
                                 scale_pos_weight=1.0, random_state=0,
                                 use_label_encoder=False, eval_metric='logloss')
         estimators = [('lr', clf_lr), ('rf', clf_rf), ('xgb', clf_xgb)]
     else:
-        clf_svm = SVC(kernel='rbf', gamma='scale', probability=True, class_weight='balanced', random_state=0)
+        clf_svm = CalibratedClassifierCV(
+            SVC(kernel='rbf', gamma='scale', class_weight='balanced', random_state=0),
+            method='sigmoid',
+            cv=3,
+            ensemble=False,
+        )
         estimators = [('lr', clf_lr), ('rf', clf_rf), ('svm', clf_svm)]
 
     voting_clf = VotingClassifier(estimators=estimators, voting='soft')
 
-    # Cross-validate
     y_pred_cv = cross_val_predict(voting_clf, X_selected, y, cv=cv, method='predict')
     acc_cv = accuracy_score(y, y_pred_cv)
 
     print(f"\nCross‑validated accuracy ({n_splits}-fold): {acc_cv:.3f}")
     print(classification_report(y, y_pred_cv, target_names=["real", "screen"]))
 
-    # ----- F1-threshold tuning (more stable than Youden) -----
     y_proba_cv = cross_val_predict(voting_clf, X_selected, y, cv=cv, method='predict_proba')[:, 1]
     fpr, tpr, thresholds = roc_curve(y, y_proba_cv)
-    # Instead of Youden, find threshold that maximises F1 on CV predictions
     best_f1 = 0.0
     best_thresh = 0.5
     for thresh in thresholds:
@@ -2573,12 +2604,10 @@ def train():
             pred_name = "real" if pred == 0 else "screen"
             print(f"  {path}  (true: {true_name}, pred: {pred_name})")
 
-    # Final fit
     voting_clf.fit(X_selected, y)
     joblib.dump((scaler, selector, voting_clf, optimal_threshold), MODEL_FILE)
     print(f"\nModel saved to {MODEL_FILE}")
     print(f"Trained on {len(X)} samples (2× horizontal flip), threshold = {optimal_threshold:.3f}")
-
 
 # --------------------------------------------------------------------------
 # Prediction (unchanged)

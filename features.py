@@ -55,6 +55,11 @@ FEATURE_NAMES = [
     "dwt_v_kurt",
     "dwt_d_kurt",
     "dwt_scale_energy_ratio",
+    "noise_variance",
+    "brightness_center_ratio" ,
+    "noise_variance",
+    "center_std_ratio",      
+    "zoom_sharpness"  
 ]
 
 

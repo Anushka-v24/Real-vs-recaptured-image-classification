@@ -4,3 +4,4 @@ scikit-learn
 PyWavelets
 joblib
 scikit-image
+Flask
